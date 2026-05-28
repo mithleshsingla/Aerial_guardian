@@ -1,0 +1,66 @@
+# ============================================================
+# Aerial Guardian — Final Configuration
+# MOTA@0.5=0.2966  MOTA@0.3=0.3803  FPS=84  Model=6MB
+# ============================================================
+
+model:
+  weights: "yolov8n.pt"
+  device: "cpu"
+  imgsz: 640
+
+detection:
+  conf_threshold: 0.35
+  iou_threshold: 0.45
+  filtering:
+    enabled: true
+    aspect_min: 0.8
+    aspect_max: 6.0
+    min_area: 16
+
+sahi:
+  enabled: true
+  slice_height: 640
+  slice_width: 640
+  overlap_height_ratio: 0.1
+  overlap_width_ratio: 0.1
+  postprocess_type: "NMM"
+  postprocess_match_threshold: 0.5
+
+  # Multi-scale SAHI — runs tile=512 AND tile=640, merges with WBF
+  # Expected: +3-6pp recall, FPS drops from 84 → ~42 (still real-time)
+  # Set multi_scale: true to enable
+  multi_scale: false
+  second_tile_size: 512       # second tile size for multi-scale pass
+  wbf_iou_threshold: 0.5      # WBF cluster IoU threshold
+  wbf_skip_box_threshold: 0.20  # discard boxes below this conf before WBF
+
+tracking:
+  track_activation_threshold: 0.35
+  lost_track_buffer: 40
+  minimum_matching_threshold: 0.7
+  frame_rate: 30
+
+motion_compensation:
+  enabled: true
+  mode: "homography"
+  max_corners: 300
+  quality_level: 0.01
+  min_distance: 8
+  lk_win_size: [21, 21]
+  lk_max_level: 3
+  flow_scale: 0.5
+  refresh_every: 1
+
+visualization:
+  tail_length: 40
+  tail_thickness: 2
+  box_thickness: 2
+  text_scale: 0.5
+  text_thickness: 1
+  show_gt_overlay: false
+
+io:
+  output_dir: "output"
+  output_fps: 20
+  output_codec: "mp4v"
+  show_fps_overlay: true
