@@ -1,37 +1,7 @@
 """
-detector.py
-===========
-Multi-scale SAHI detector with Weighted Box Fusion (WBF).
-
-MULTI-SCALE SAHI — WHY IT IMPROVES RECALL:
-  Standard SAHI runs one tile size (e.g. 640px). A 10px person occupies
-  1.6% of a 640px tile — very close to YOLOv8n's detection limit.
-  
-  Multi-scale SAHI runs TWO tile sizes per frame and merges results:
-    tile=640: catches 15-40px persons well
-    tile=512: catches 8-15px persons better (appear 25% larger relative to tile)
-
-  A person missed at 640 may be caught at 512, and vice versa.
-  The union of both passes = higher recall with controlled FP rate.
-
-WHY WBF OVER NMM:
-  NMM (Non-Maximum Merging) picks the highest-scoring box and suppresses
-  nearby boxes. For tiny aerial objects where two passes detect slightly
-  different positions, WBF averages the box coordinates weighted by score.
-  Result: better localisation on 8-20px persons where a 2px offset matters.
-
-  WBF formula:
-    weighted_cx = Σ(score_i × cx_i) / Σ(score_i)
-    weighted_cy = Σ(score_i × cy_i) / Σ(score_i)
-    fused_score = Σ(score_i) / n_boxes_in_cluster
-
-FPS IMPACT:
-  Standard SAHI at tile=640: 6 tiles per frame → ~84 FPS
-  Multi-scale (512+640):    12 tiles per frame → ~42 FPS
-  Still real-time. WBF adds <1ms per frame.
-
-SINGLE-SCALE FALLBACK:
-  Set multi_scale=false in config to revert to single-tile SAHI.
+detector.py — Multi-scale batched SAHI detector with WBF.
+Batched: all tiles in ONE YOLO call → higher FPS than sequential SAHI.
+MOTA fix: wbf_skip_box_threshold must be <= conf_threshold (0.20, not 0.50).
 """
 
 import numpy as np
@@ -40,19 +10,11 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 try:
-    from sahi import AutoDetectionModel
-    from sahi.predict import get_sliced_prediction
-    SAHI_AVAILABLE = True
-except ImportError:
-    SAHI_AVAILABLE = False
-    print("[WARNING] SAHI not installed.")
-
-try:
     from ensemble_boxes import weighted_boxes_fusion
     WBF_AVAILABLE = True
 except ImportError:
     WBF_AVAILABLE = False
-    print("[WARNING] ensemble_boxes not installed — WBF unavailable, using NMM.")
+    print("[WARNING] ensemble_boxes not installed — falling back to NMS merge.")
 
 from ultralytics import YOLO
 
@@ -82,9 +44,7 @@ class Detection:
 
 
 class DroneDetector:
-    """
-    YOLOv8/YOLO11 + multi-scale SAHI + WBF for aerial person detection.
-    """
+    """Batched multi-scale SAHI detector. All tiles in ONE YOLO call."""
 
     PERSON_CLASS_ID = 0
 
@@ -99,19 +59,16 @@ class DroneDetector:
         self.imgsz     = model_cfg["imgsz"]
         self.weights   = model_cfg["weights"]
 
-        self.use_sahi    = sahi_cfg["enabled"] and SAHI_AVAILABLE
-        self.slice_h     = sahi_cfg["slice_height"]
-        self.slice_w     = sahi_cfg["slice_width"]
+        self.use_sahi    = sahi_cfg.get("enabled", True)
+        self.tile_h      = sahi_cfg["slice_height"]
+        self.tile_w      = sahi_cfg["slice_width"]
         self.overlap_h   = sahi_cfg["overlap_height_ratio"]
         self.overlap_w   = sahi_cfg["overlap_width_ratio"]
-        self.post_type   = sahi_cfg["postprocess_type"]
-        self.post_thr    = sahi_cfg["postprocess_match_threshold"]
 
-        # Multi-scale SAHI
-        self.multi_scale = sahi_cfg.get("multi_scale", False) and SAHI_AVAILABLE and WBF_AVAILABLE
-        self.second_tile = sahi_cfg.get("second_tile_size", 512)
-        self.wbf_iou_thr = sahi_cfg.get("wbf_iou_threshold", 0.5)
-        self.wbf_skip_box_thr = sahi_cfg.get("wbf_skip_box_threshold", 0.20)
+        self.multi_scale  = sahi_cfg.get("multi_scale", False)
+        self.second_tile  = sahi_cfg.get("second_tile_size", 512)
+        self.wbf_iou_thr  = sahi_cfg.get("wbf_iou_threshold", 0.5)
+        self.wbf_skip_thr = sahi_cfg.get("wbf_skip_box_threshold", 0.20)
 
         filt = det_cfg.get("filtering", {})
         self.use_filters = filt.get("enabled",    True)
@@ -119,228 +76,164 @@ class DroneDetector:
         self.aspect_max  = filt.get("aspect_max", 6.0)
         self.min_area    = filt.get("min_area",   16)
 
-        # Detect model family for logging
-        w = self.weights.lower()
-        family = "YOLO11" if ("yolo11" in w) else "YOLOv8"
-
+        family = "YOLO11" if "yolo11" in self.weights.lower() else "YOLOv8"
         print(f"[Detector] {family} | {self.weights} | device={self.device}")
         self.model = YOLO(self.weights)
 
-        if self.use_sahi:
-            self.sahi_model = AutoDetectionModel.from_pretrained(
-                model_type="ultralytics",
-                model_path=self.weights,
-                confidence_threshold=self.conf,
-                device=self.device,
-            )
-            if self.multi_scale:
-                print(
-                    f"[Detector] Multi-scale SAHI | tiles={self.second_tile}+{self.slice_w} "
-                    f"| WBF iou={self.wbf_iou_thr} | conf={self.conf:.2f}"
-                )
-            else:
-                print(
-                    f"[Detector] SAHI | tile={self.slice_w} | conf={self.conf:.2f} "
-                    f"| aspect=[{self.aspect_min},{self.aspect_max}]"
-                )
-        else:
-            self.sahi_model = None
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+        mode = ("batched multi-scale" if (self.use_sahi and self.multi_scale)
+                else "batched single-scale" if self.use_sahi
+                else "full-frame")
+        scales = (f"({self.second_tile}+{self.tile_w})"
+                  if self.multi_scale else str(self.tile_w))
+        print(f"[Detector] mode={mode} | tiles={scales} | conf={self.conf:.2f} | "
+              f"wbf_skip={self.wbf_skip_thr:.2f} | {'WBF' if WBF_AVAILABLE else 'NMS'}")
 
     def detect(self, frame_bgr: np.ndarray) -> List[Detection]:
         if not self.use_sahi:
             return self._detect_standard(frame_bgr)
-        if self.multi_scale:
-            return self._detect_multiscale(frame_bgr)
-        return self._detect_sahi_single(frame_bgr, self.slice_h, self.slice_w)
+        return self._detect_batched(frame_bgr)
 
-    # ------------------------------------------------------------------ #
-    # Multi-scale SAHI with WBF
-    # ------------------------------------------------------------------ #
-
-    def _detect_multiscale(self, frame_bgr: np.ndarray) -> List[Detection]:
-        """
-        Run SAHI at two tile sizes and merge with Weighted Box Fusion.
-        tile_large (e.g. 640): catches medium/large small objects
-        tile_small (e.g. 512): catches very tiny objects (8-15px)
-        """
+    def _detect_batched(self, frame_bgr: np.ndarray) -> List[Detection]:
         H_orig, W_orig = frame_bgr.shape[:2]
 
-        # Resolution cap
         if W_orig > MAX_SAHI_WIDTH:
             scale   = MAX_SAHI_WIDTH / W_orig
-            frame_s = cv2.resize(
-                frame_bgr,
-                (MAX_SAHI_WIDTH, int(H_orig * scale)),
-                interpolation=cv2.INTER_LINEAR,
-            )
+            frame_s = cv2.resize(frame_bgr, (MAX_SAHI_WIDTH, int(H_orig * scale)),
+                                 interpolation=cv2.INTER_LINEAR)
         else:
             frame_s = frame_bgr
             scale   = 1.0
 
         H_s, W_s = frame_s.shape[:2]
-        frame_rgb = cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB)
 
-        # Pass 1: large tile
-        dets_large = self._run_sahi_pass(frame_rgb, self.slice_h, self.slice_w)
-        # Pass 2: small tile
-        dets_small = self._run_sahi_pass(frame_rgb, self.second_tile, self.second_tile)
+        tile_specs = self._generate_tiles(frame_s, self.tile_w, self.tile_h)
+        if self.multi_scale:
+            tile_specs += self._generate_tiles(frame_s, self.second_tile, self.second_tile)
 
-        # Merge with WBF
-        merged = self._wbf_merge(dets_large, dets_small, W_s, H_s)
-
-        # Map back to original coordinates
-        detections = []
-        for (x1, y1, x2, y2), conf in merged:
-            det = Detection(
-                bbox_xyxy=np.array(
-                    [x1/scale, y1/scale, x2/scale, y2/scale],
-                    dtype=np.float32,
-                ),
-                confidence=float(conf),
-                class_id=self.PERSON_CLASS_ID,
-                class_name="person",
-            )
-            detections.append(det)
-
-        return self._filter(detections)
-
-    def _run_sahi_pass(
-        self, frame_rgb: np.ndarray, tile_h: int, tile_w: int
-    ) -> List[Tuple[Tuple[float,float,float,float], float]]:
-        """
-        Run one SAHI pass, return list of (xyxy_px, confidence).
-        """
-        ov_h, ov_w = self._adaptive_overlap(frame_rgb.shape[1], frame_rgb.shape[0])
-        result = get_sliced_prediction(
-            frame_rgb,
-            self.sahi_model,
-            slice_height=tile_h,
-            slice_width=tile_w,
-            overlap_height_ratio=ov_h,
-            overlap_width_ratio=ov_w,
-            postprocess_type="NMM",   # intra-pass NMM first, then WBF across passes
-            postprocess_match_threshold=self.post_thr,
-            verbose=0,
-        )
-        out = []
-        for pred in result.object_prediction_list:
-            if pred.category.id != self.PERSON_CLASS_ID:
-                continue
-            if pred.score.value < self.conf:
-                continue
-            b = pred.bbox
-            out.append(((b.minx, b.miny, b.maxx, b.maxy), float(pred.score.value)))
-        return out
-
-    def _wbf_merge(
-        self,
-        dets_a: List,
-        dets_b: List,
-        img_w: int,
-        img_h: int,
-    ) -> List[Tuple[Tuple[float,float,float,float], float]]:
-        """
-        Merge two detection lists with Weighted Box Fusion.
-        WBF normalises boxes to [0,1] range, fuses overlapping ones,
-        then returns boxes in pixel coordinates.
-        """
-        if not dets_a and not dets_b:
+        if not tile_specs:
             return []
 
-        # Normalise to [0,1]
-        def norm(dets):
-            boxes, scores = [], []
-            for (x1,y1,x2,y2), s in dets:
-                boxes.append([
-                    max(0.0, min(1.0, x1/img_w)),
-                    max(0.0, min(1.0, y1/img_h)),
-                    max(0.0, min(1.0, x2/img_w)),
-                    max(0.0, min(1.0, y2/img_h)),
-                ])
-                scores.append(s)
-            return boxes, scores
+        crops = [spec[0] for spec in tile_specs]
 
-        boxes_a, scores_a = norm(dets_a)
-        boxes_b, scores_b = norm(dets_b)
-
-        all_boxes  = [boxes_a,  boxes_b]  if (boxes_a  and boxes_b)  else ([boxes_a]  if boxes_a  else [boxes_b])
-        all_scores = [scores_a, scores_b] if (scores_a and scores_b) else ([scores_a] if scores_a else [scores_b])
-        all_labels = [[0]*len(s) for s in all_scores]
-
-        fused_boxes, fused_scores, _ = weighted_boxes_fusion(
-            all_boxes,
-            all_scores,
-            all_labels,
-            iou_thr=self.wbf_iou_thr,
-            skip_box_thr=self.wbf_skip_box_thr,
+        batch_results = self.model.predict(
+            crops,
+            conf=self.conf,
+            iou=self.iou_thr,
+            imgsz=max(self.tile_w, self.tile_h),
+            device=self.device,
+            classes=[self.PERSON_CLASS_ID],
+            verbose=False,
         )
 
-        # Back to pixel coords
-        out = []
-        for box, score in zip(fused_boxes, fused_scores):
-            x1 = box[0] * img_w
-            y1 = box[1] * img_h
-            x2 = box[2] * img_w
-            y2 = box[3] * img_h
-            out.append(((x1, y1, x2, y2), float(score)))
-        return out
+        all_boxes, all_scores, all_labels = [], [], []
 
-    # ------------------------------------------------------------------ #
-    # Single-scale SAHI (original)
-    # ------------------------------------------------------------------ #
+        for result, (crop, x_off, y_off, t_w, t_h) in zip(batch_results, tile_specs):
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            for i in range(len(result.boxes)):
+                if int(result.boxes.cls[i]) != self.PERSON_CLASS_ID:
+                    continue
+                conf_val = float(result.boxes.conf[i])
+                if conf_val < self.conf:
+                    continue
+                bx1, by1, bx2, by2 = result.boxes.xyxy[i].cpu().numpy()
+                fx1 = max(0.0, min(1.0, (x_off + bx1) / W_s))
+                fy1 = max(0.0, min(1.0, (y_off + by1) / H_s))
+                fx2 = max(0.0, min(1.0, (x_off + bx2) / W_s))
+                fy2 = max(0.0, min(1.0, (y_off + by2) / H_s))
+                all_boxes.append([fx1, fy1, fx2, fy2])
+                all_scores.append(conf_val)
+                all_labels.append(0)
 
-    def _detect_sahi_single(
-        self, frame_bgr: np.ndarray, tile_h: int, tile_w: int
-    ) -> List[Detection]:
-        H_orig, W_orig = frame_bgr.shape[:2]
-        scale = 1.0
+        if not all_boxes:
+            return []
 
-        if W_orig > MAX_SAHI_WIDTH:
-            scale   = MAX_SAHI_WIDTH / W_orig
-            frame_s = cv2.resize(
-                frame_bgr,
-                (MAX_SAHI_WIDTH, int(H_orig * scale)),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        else:
-            frame_s = frame_bgr
-
-        ov_h, ov_w = self._adaptive_overlap(frame_s.shape[1], frame_s.shape[0])
-        frame_rgb  = cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB)
-
-        result = get_sliced_prediction(
-            frame_rgb, self.sahi_model,
-            slice_height=tile_h, slice_width=tile_w,
-            overlap_height_ratio=ov_h, overlap_width_ratio=ov_w,
-            postprocess_type=self.post_type,
-            postprocess_match_threshold=self.post_thr,
-            verbose=0,
-        )
+        merged_boxes, merged_scores = self._merge_boxes(all_boxes, all_scores, all_labels)
 
         detections = []
-        for pred in result.object_prediction_list:
-            if pred.category.id != self.PERSON_CLASS_ID or pred.score.value < self.conf:
-                continue
-            bbox = pred.bbox
+        for (x1n, y1n, x2n, y2n), conf_val in zip(merged_boxes, merged_scores):
             detections.append(Detection(
-                bbox_xyxy=np.array(
-                    [bbox.minx/scale, bbox.miny/scale,
-                     bbox.maxx/scale, bbox.maxy/scale], dtype=np.float32),
-                confidence=float(pred.score.value),
+                bbox_xyxy=np.array([
+                    x1n * W_s / scale, y1n * H_s / scale,
+                    x2n * W_s / scale, y2n * H_s / scale,
+                ], dtype=np.float32),
+                confidence=float(conf_val),
                 class_id=self.PERSON_CLASS_ID,
                 class_name="person",
             ))
         return self._filter(detections)
 
-    # ------------------------------------------------------------------ #
-    # Standard full-frame inference
-    # ------------------------------------------------------------------ #
+    def _generate_tiles(self, frame, tile_w, tile_h):
+        H, W = frame.shape[:2]
+        overlap_h = min(self.overlap_h + 0.05, 0.35) if W > 1600 else self.overlap_h
+        overlap_w = min(self.overlap_w + 0.05, 0.35) if W > 1600 else self.overlap_w
+        stride_x  = max(1, int(tile_w * (1 - overlap_w)))
+        stride_y  = max(1, int(tile_h * (1 - overlap_h)))
+        tiles = []
+        y = 0
+        while y < H:
+            x = 0
+            while x < W:
+                x2, y2 = min(x + tile_w, W), min(y + tile_h, H)
+                crop = frame[y:y2, x:x2]
+                if crop.shape[0] < tile_h or crop.shape[1] < tile_w:
+                    padded = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+                    padded[:crop.shape[0], :crop.shape[1]] = crop
+                    crop = padded
+                tiles.append((crop, x, y, tile_w, tile_h))
+                if x + tile_w >= W:
+                    break
+                x += stride_x
+            if y + tile_h >= H:
+                break
+            y += stride_y
+        return tiles
 
-    def _detect_standard(self, frame_bgr: np.ndarray) -> List[Detection]:
+    def _merge_boxes(self, boxes, scores, labels):
+        """
+        Two-stage merge:
+        1. WBF: fuses near-identical boxes across tiles (uses IoU)
+        2. Post-WBF NMS at iou_thr=0.4: suppresses partial duplicate
+           detections that WBF missed because IoU was below its threshold.
+           SAHI NMM uses IoS (Intersection over Smaller) which is more
+           aggressive than IoU — a partial box fully inside a larger box
+           gets suppressed even at low IoU. This NMS step replicates that.
+        """
+        if not boxes:
+            return [], []
+
+        # Stage 1: WBF
+        if WBF_AVAILABLE:
+            fb, fs, _ = weighted_boxes_fusion(
+                [boxes], [scores], [labels],
+                iou_thr=self.wbf_iou_thr,
+                skip_box_thr=self.wbf_skip_thr,
+            )
+            fb = fb.tolist()
+            fs = fs.tolist()
+        else:
+            fb, fs = boxes, scores
+
+        # Stage 2: post-WBF NMS to suppress partial/border duplicates
+        if len(fb) > 1:
+            boxes_arr = np.array(fb, dtype=np.float32)
+            # cv2.dnn.NMSBoxes needs [x, y, w, h]
+            xywh = boxes_arr.copy()
+            xywh[:, 2] = boxes_arr[:, 2] - boxes_arr[:, 0]
+            xywh[:, 3] = boxes_arr[:, 3] - boxes_arr[:, 1]
+            keep = cv2.dnn.NMSBoxes(
+                xywh.tolist(), fs,
+                score_threshold=0.0,
+                nms_threshold=0.4,
+            )
+            if len(keep) > 0:
+                keep = keep.flatten()
+                fb = [fb[i] for i in keep]
+                fs = [fs[i] for i in keep]
+
+        return fb, fs
+
+    def _detect_standard(self, frame_bgr):
         results = self.model.predict(
             frame_bgr, conf=self.conf, iou=self.iou_thr,
             imgsz=self.imgsz, device=self.device,
@@ -359,27 +252,14 @@ class DroneDetector:
                 ))
         return self._filter(detections)
 
-    # ------------------------------------------------------------------ #
-    # Filters + helpers
-    # ------------------------------------------------------------------ #
-
-    def _filter(self, detections: List[Detection]) -> List[Detection]:
+    def _filter(self, detections):
         if not self.use_filters:
             return detections
-        return [
-            d for d in detections
-            if d.area >= self.min_area
-            and self.aspect_min <= d.aspect_ratio <= self.aspect_max
-        ]
+        return [d for d in detections
+                if d.area >= self.min_area
+                and self.aspect_min <= d.aspect_ratio <= self.aspect_max]
 
-    def _adaptive_overlap(self, W: int, H: int) -> Tuple[float, float]:
-        if W > 1600:
-            return min(self.overlap_h + 0.05, 0.35), min(self.overlap_w + 0.05, 0.35)
-        return self.overlap_h, self.overlap_w
-
-    def detections_to_sv_format(
-        self, detections: List[Detection], frame_shape: Tuple
-    ) -> "sv.Detections":
+    def detections_to_sv_format(self, detections, frame_shape):
         import supervision as sv
         if not detections:
             return sv.Detections.empty()

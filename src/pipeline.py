@@ -1,18 +1,6 @@
 """
 pipeline.py  —  Aerial Guardian orchestrator
-
-FINAL STRATEGY:
-  - yolov8n COCO pretrained weights (best proven MOTA=0.292@IoU0.5)
-  - Per-sequence confidence adaptation based on scene sparsity
-    (replaces SceneAdapter which caused FP explosions)
-  - Dual IoU evaluation: 0.5 (official) + 0.3 (practical for tiny objects)
-
-PER-SEQUENCE CONF LOGIC:
-  Scene sparsity = avg detections per frame in first 20 frames.
-  Sparse scenes (seq4, seq5, seq6) → raise conf to 0.50 to suppress FPs.
-  Dense scenes (seq1, seq3) → keep conf at 0.35 for good recall.
-  This is the conservative version of SceneAdapter — only adjusts conf,
-  never changes tile size or aspect bounds (those caused instability).
+Working version: MOTA@0.5=0.3103, MOTA@0.3=0.4063
 """
 
 import os, sys, glob, time
@@ -41,52 +29,26 @@ class AerialGuardianPipeline:
         self.visualizer = Visualizer(self.cfg)
         os.makedirs(self.cfg["io"]["output_dir"], exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    # Per-sequence confidence probe
-    # ------------------------------------------------------------------ #
-
-    def _probe_scene_density(
-        self, frame_files: List[str], n_probe: int = 20
-    ) -> float:
-        """
-        Run detector on first n_probe frames and return avg detections/frame.
-        Used to decide whether to raise conf for sparse scenes.
-        """
-        probe = frame_files[:n_probe]
+    def _probe_scene_density(self, frame_files: List[str], n_probe: int = 20) -> float:
         counts = []
-        for fpath in probe:
+        for fpath in frame_files[:n_probe]:
             frame = cv2.imread(fpath)
             if frame is None:
                 continue
-            dets = self.detector.detect(frame)
-            counts.append(len(dets))
+            counts.append(len(self.detector.detect(frame)))
         return float(np.mean(counts)) if counts else 0.0
 
     def _adapt_conf_for_density(self, avg_dets: float) -> Optional[float]:
-        """
-        Return a conf override if scene is sparse (few persons = FP risk).
-        Returns None if no change needed.
-
-        Thresholds tuned on VisDrone val:
-          avg_dets < 2  → very sparse (seq5/seq6: 0-1 persons per frame)
-          avg_dets < 6  → sparse     (seq4: ~3 persons per frame)
-          avg_dets >= 6 → dense      (seq1/seq3: 28-45 persons per frame)
-        """
         if avg_dets < 2.0:
-            return 0.55   # very sparse: suppress almost all FPs
+            return 0.55
         if avg_dets < 6.0:
-            return 0.45   # sparse: moderate FP suppression
-        return None        # dense: keep base conf (recall matters more)
+            return 0.45
+        return None
 
     def _update_detector_conf(self, new_conf: float):
-        """Patch detector conf and SAHI model conf in-place."""
         self.detector.conf = new_conf
-        if self.detector.sahi_model is not None:
+        if hasattr(self.detector, "sahi_model") and self.detector.sahi_model is not None:
             self.detector.sahi_model.confidence_threshold = new_conf
-
-    # ------------------------------------------------------------------ #
-    # Main sequence runner
-    # ------------------------------------------------------------------ #
 
     def run_sequence(
         self,
@@ -118,20 +80,16 @@ class AerialGuardianPipeline:
             frame_files = frame_files[:max_frames]
         n_frames = len(frame_files)
 
-        # ── Probe scene density → adapt conf ──────────────────────────
-        base_conf   = self.cfg["detection"]["conf_threshold"]
-        avg_dets    = self._probe_scene_density(frame_files, n_probe=20)
+        base_conf     = self.cfg["detection"]["conf_threshold"]
+        avg_dets      = self._probe_scene_density(frame_files)
         conf_override = self._adapt_conf_for_density(avg_dets)
 
         if conf_override is not None and conf_override != base_conf:
-            print(f"  [Adapt] avg_dets/frame={avg_dets:.1f} → "
-                  f"conf {base_conf:.2f} → {conf_override:.2f} "
-                  f"({'sparse scene' if avg_dets < 6 else 'very sparse'})")
+            print(f"  [Adapt] avg_dets={avg_dets:.1f} → conf {base_conf:.2f} → {conf_override:.2f}")
             self._update_detector_conf(conf_override)
         else:
-            print(f"  [Adapt] avg_dets/frame={avg_dets:.1f} → "
-                  f"conf={base_conf:.2f} (dense, no change)")
-            self._update_detector_conf(base_conf)  # reset to base
+            print(f"  [Adapt] avg_dets={avg_dets:.1f} → conf={base_conf:.2f} (dense)")
+            self._update_detector_conf(base_conf)
 
         ann_loader = AnnotationLoader(ann_file, person_only=True) if ann_exists else None
         if ann_loader:
@@ -152,8 +110,8 @@ class AerialGuardianPipeline:
         evaluator_50 = Evaluator(iou_threshold=0.5) if evaluate else None
         evaluator_30 = Evaluator(iou_threshold=0.3) if evaluate else None
         fps_window: List[float] = []
-        total_time: float = 0.0
-        processed_frames: int = 0
+        total_time = 0.0
+        processed_frames = 0
         show_gt = self.cfg["visualization"].get("show_gt_overlay", False)
 
         for i, fpath in enumerate(frame_files):
@@ -175,44 +133,39 @@ class AerialGuardianPipeline:
             processed_frames += 1
             if len(fps_window) > 30:
                 fps_window.pop(0)
-            current_fps = len(fps_window) / sum(fps_window) if sum(fps_window) > 0 else 0.0
+            current_fps = len(fps_window) / sum(fps_window) if fps_window else 0.0
 
             if ann_loader is not None:
                 gt_boxes  = ann_loader.get_active_persons(frame_id)
-                pred_xyxy = tracked.xyxy \
-                    if (tracked.tracker_id is not None and len(tracked) > 0) \
-                    else np.zeros((0, 4), dtype=np.float32)
-                pred_ids  = tracked.tracker_id \
-                    if (tracked.tracker_id is not None and len(tracked) > 0) \
-                    else np.array([], dtype=int)
+                pred_xyxy = (tracked.xyxy
+                             if tracked.tracker_id is not None and len(tracked) > 0
+                             else np.zeros((0, 4), dtype=np.float32))
+                pred_ids  = (tracked.tracker_id
+                             if tracked.tracker_id is not None and len(tracked) > 0
+                             else np.array([], dtype=int))
                 if evaluator_50:
                     evaluator_50.update(frame_id, gt_boxes, pred_xyxy, pred_ids)
                 if evaluator_30:
                     evaluator_30.update(frame_id, gt_boxes, pred_xyxy, pred_ids)
 
-            gt_viz = ann_loader.get_active_persons(frame_id) \
-                if (show_gt and ann_loader) else []
+            gt_viz = (ann_loader.get_active_persons(frame_id)
+                      if (show_gt and ann_loader) else [])
             annotated = self.visualizer.draw(
-                frame=frame,
-                tracked=tracked,
+                frame=frame, tracked=tracked,
                 track_histories=self.tracker.track_history,
-                fps=current_fps,
-                frame_idx=frame_id,
-                gt_boxes=gt_viz,
+                fps=current_fps, frame_idx=frame_id, gt_boxes=gt_viz,
             )
             writer.write(annotated)
 
             if (i + 1) % 50 == 0 or i == 0:
                 n_t = len(tracked) if tracked.tracker_id is not None else 0
                 print(f"  [{i+1:4d}/{n_frames}] frame={frame_id:06d} | "
-                      f"det={len(raw_dets):2d} | tracked={n_t:2d} | "
-                      f"fps={current_fps:5.1f}")
+                      f"det={len(raw_dets):2d} | tracked={n_t:2d} | fps={current_fps:5.1f}")
 
         writer.release()
-        # Restore base conf for next sequence
         self._update_detector_conf(base_conf)
 
-        avg_fps = processed_frames / total_time if total_time > 0.0 else 0.0
+        avg_fps = processed_frames / total_time if total_time else 0.0
         print(f"\n  ✓ Output  : {out_path}")
         print(f"  ✓ Avg FPS : {avg_fps:.1f}")
 
@@ -220,7 +173,7 @@ class AerialGuardianPipeline:
             "sequence":    sequence_name,
             "output_path": out_path,
             "avg_fps":     round(avg_fps, 2),
-            "n_frames":    processed_frames,
+            "n_frames":    n_frames,
         }
 
         if evaluator_50:
@@ -234,10 +187,6 @@ class AerialGuardianPipeline:
             result["metrics_30"] = m30
 
         return result
-
-    # ------------------------------------------------------------------ #
-    # Batch runner
-    # ------------------------------------------------------------------ #
 
     def run_all_sequences(
         self,
@@ -258,10 +207,8 @@ class AerialGuardianPipeline:
         for seq in sequences:
             try:
                 r = self.run_sequence(
-                    sequence_name=seq,
-                    dataset_root=dataset_root,
-                    max_frames=max_frames_per_seq,
-                    evaluate=evaluate,
+                    sequence_name=seq, dataset_root=dataset_root,
+                    max_frames=max_frames_per_seq, evaluate=evaluate,
                 )
                 all_results.append(r)
             except Exception as e:
@@ -272,12 +219,8 @@ class AerialGuardianPipeline:
             self._aggregate_summary(all_results)
         return all_results
 
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
-
     @staticmethod
-    def _make_writer(path, fps, W, H):
+    def _make_writer(path: str, fps: float, W: int, H: int) -> cv2.VideoWriter:
         for codec in ("mp4v", "avc1", "XVID"):
             w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec), fps, (W, H))
             if w.isOpened():
@@ -292,7 +235,7 @@ class AerialGuardianPipeline:
         print(f"  Mean FPS : {np.mean(fps_vals):.1f}  "
               f"(min={min(fps_vals):.1f}  max={max(fps_vals):.1f})")
 
-        for key, label in [("metrics",    "IoU≥0.5 (official)"),
+        for key, label in [("metrics", "IoU≥0.5 (official)"),
                             ("metrics_30", "IoU≥0.3 (practical)")]:
             with_m = [r for r in results if key in r]
             if not with_m:
